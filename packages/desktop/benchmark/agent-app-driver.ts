@@ -199,7 +199,9 @@ await sdk.serveDriver({
     protocolVersion: 1,
     application: { id: "opencode", name: "OpenCode", version: desktopPackage.version, buildDigestSha256 },
     driver: { name: "opencode-desktop-driver", version: "1", sourceCommit, digestSha256: driverDigestSha256 },
-    scenarios: ["app-start-v3", "session-switch-v3", "session-navigation-v1"],
+    // workspace-panel-v2 is advertised so a paired schedule can include it; its
+    // actions are reported as unsupported (never scored as zero).
+    scenarios: ["app-start-v3", "session-switch-v3", "session-navigation-v1", "workspace-panel-v2"],
     sourceEventFormats: ["opencode-event-v2"],
     materializationModes: ["native-opencode"],
     guiFramework: "electron",
@@ -296,6 +298,9 @@ await sdk.serveDriver({
       }
       const clock: ActivationClock = await launch.activate(destination)
       return execution(String(benchmarkCase.caseId), clock)
+    }
+    if (scenarioId === "workspace-panel-v2") {
+      throw new Error("OpenCode driver does not seed workspace panel loads; workspace-panel-v2 actions are unsupported")
     }
     throw new Error(`OpenCode driver does not support scenario ${scenarioId}`)
   },
