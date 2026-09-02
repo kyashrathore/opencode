@@ -57,6 +57,21 @@ export function isolatedEnvironment(stateRoot: string): Record<string, string> {
   return { ...env, ...stateEnv(stateRoot) }
 }
 
+/**
+ * Registers the corpus workspaces in the app's own persisted project list
+ * (`opencode.global.dat`, the store the desktop app keeps per profile), the way
+ * a user's profile remembers folders they have opened. The home page then lists
+ * every workspace's sessions on first launch without navigating into a
+ * workspace, which would otherwise open its most recent session unasked.
+ */
+async function seedProfileProjects(stateRoot: string, workspaces: Map<string, string>) {
+  const projects = [...workspaces.keys()].sort().map((workspaceId) => ({ worktree: workspaces.get(workspaceId)!, expanded: true }))
+  const store = {
+    server: JSON.stringify({ list: [], projects: { local: projects }, lastProject: { local: projects[0]?.worktree }, recentlyClosed: {} }),
+  }
+  await writeFile(path.join(statePaths(stateRoot).profile, "opencode.global.dat"), JSON.stringify(store, null, "\t"))
+}
+
 export async function prepareStateRoot(stateRoot: string) {
   const env = stateEnv(stateRoot)
   const directories = [
@@ -124,6 +139,7 @@ export async function materializeCorpus(input: {
     await ensureWorkspaceRepository(directory, env)
     workspaces.set(workspaceId, directory)
   }
+  await seedProfileProjects(input.stateRoot, workspaces)
 
   const cli = path.join(input.repoRoot, "packages", "opencode", "src", "index.ts")
   const targets = new Map<string, ReadinessTarget>()

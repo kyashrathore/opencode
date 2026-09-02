@@ -102,28 +102,13 @@ export async function launchOpenCode(input: {
     page = await connectCdpPage({ port: debugPort, process: application, timeoutMs })
     const connected = page
     await installInputRecorder(connected)
-    // Route only once the app shell (and its router) is mounted; an earlier
-    // anchor click becomes a real page load at a deep path with no assets.
+    await connected.rawCommand("Page.bringToFront", {})
+    // Wait for the app shell before touching any control.
     await connected.waitForFunction(() => !!document.querySelector('[data-slot="titlebar-v2"], [data-slot="home-projects-scroll"], [data-component="prompt-input"]'), undefined, { polling: "raf", timeout: timeoutMs })
-    // The control session is reached the way a user reaches it: the workspace
-    // is opened, the home page lists its sessions, and the row is clicked. The
-    // app-start clock runs from process spawn to that session being painted.
-    // Projects are opened the way the CLI and OS open them: an
-    // `opencode://open-project` deep link handed to the running instance through
-    // Electron's second-instance argv (same profile, same lock). The app drains
-    // it when a workspace route mounts, so the opener is followed by a route.
-    const openProject = async (directory: string) => {
-      log(`open-project ${path.basename(directory)}`)
-      const second = Bun.spawn({
-        cmd: [input.executable, ...keychainArgs(), `opencode://open-project?directory=${encodeURIComponent(directory)}`],
-        env: { ...isolatedEnvironment(input.stateRoot), OPENCODE_DESKTOP_USER_DATA_DIR: paths.profile },
-        stdout: "ignore",
-        stderr: "ignore",
-      })
-      await Promise.race([second.exited, Bun.sleep(8_000)])
-      if (second.exitCode === null) second.kill("SIGKILL")
-    }
-    const ready = await activateSession(connected, input.control, input.workspaces, timeoutMs, log, openProject)
+    // The control session is reached the way a user reaches it: the home page
+    // lists the workspace's sessions and the row is clicked (or its open tab).
+    // The app-start clock runs from process spawn to that session being painted.
+    const ready = await activateSession(connected, input.control, input.workspaces, timeoutMs, log)
     const readyAtMs = ready.timeOrigin + ready.paintedAt - performance.timeOrigin
 
     const table = await readProcessTable()
@@ -149,7 +134,7 @@ export async function launchOpenCode(input: {
       spawnAtMs,
       readyAtMs,
       async activate(target) {
-        const result = await activateSession(connected, target, input.workspaces, timeoutMs, log, openProject)
+        const result = await activateSession(connected, target, input.workspaces, timeoutMs, log)
         return { kind: "single-monotonic-clock", clock: "performance.now", start: result.trustedInputAt, end: result.paintedAt }
       },
       async wasDisplayed(target) {
@@ -218,40 +203,60 @@ async function installInputRecorder(page: BenchmarkPage) {
 }
 
 
-function workspaceSlug(directory: string) {
-  return Buffer.from(directory, "utf8").toString("base64").replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=/gu, "")
+/**
+ * Returns to the home page through the titlebar's Home button. The renderer
+ * runs a memory router, so the window location never drives navigation.
+ */
+async function goHome(page: BenchmarkPage, log: (line: string) => void, timeoutMs = 30_000) {
+  await page.waitForFunction(
+    () => !!document.querySelector('[data-slot="titlebar-v2"] button[aria-label="Home"]'),
+    undefined,
+    { polling: "raf", timeout: timeoutMs },
+  )
+  let attempt = 0
+  while (attempt < 3) {
+    const state = await page.evaluate(() => {
+      if (document.querySelector('[data-slot="home-projects-scroll"]')) return "home"
+      const button = document.querySelector<HTMLElement>('[data-slot="titlebar-v2"] button[aria-label="Home"]')
+      if (!button) return "no-button"
+      button.click()
+      return "clicked"
+    })
+    if (state === "home") return
+    attempt += 1
+    log(`go-home: ${state} (attempt ${String(attempt)})`)
+    const shown = await page
+      .waitForFunction(() => !!document.querySelector('[data-slot="home-projects-scroll"]'), undefined, { polling: "raf", timeout: 3_000 })
+      .then(() => true, () => false)
+    if (shown) return
+  }
+  const snapshot = await page.evaluate(() => ({
+    tabs: [...document.querySelectorAll<HTMLElement>('[data-slot="titlebar-tab-item"]')].map((tab) => tab.innerText.replace(/\s+/gu, " ").trim()),
+    tabSample: document.querySelector<HTMLElement>('[data-slot="titlebar-tab-item"]')?.outerHTML.slice(0, 600),
+    homeButton: document.querySelector<HTMLElement>('[data-slot="titlebar-v2"] button[aria-label="Home"]')?.outerHTML.slice(0, 300),
+    rows: document.querySelectorAll('[data-component="home-session-row"]').length,
+    text: document.body.innerText.slice(0, 300),
+  }))
+  throw new Error(`OpenCode never showed the home page: ${JSON.stringify(snapshot)}`)
 }
 
 /**
- * Follows an in-app route the way the app's own links do: a router-handled
- * anchor click. The router only intercepts clicks once the app is idle, so the
- * home page must have rendered first; if the click still became a real page
- * load (a deep path with no assets), reload the renderer document and retry.
+ * Frame timing needs a visible window: rAF stops while the document is hidden
+ * or the window is fully occluded, so every frame-based wait would starve.
  */
-async function followRoute(page: BenchmarkPage, href: string, timeoutMs = 30_000) {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    await page.waitForFunction(
-      () => !!document.querySelector('[data-slot="home-projects-scroll"], [data-slot="titlebar-tabs"]') && document.readyState === "complete",
-      undefined,
-      { polling: "raf", timeout: timeoutMs },
-    )
-    await page.evaluate<void>(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-    await page.evaluate((target: string) => {
-      const anchor = document.createElement("a")
-      anchor.href = target
-      anchor.textContent = "benchmark-route"
-      document.body.appendChild(anchor)
-      anchor.click()
-      anchor.remove()
-    }, href)
-    await Bun.sleep(300)
-    const url = await page.evaluate(() => location.href).catch(() => "")
-    if (url === "" || /\/index\.html(?:[#?]|$)/u.test(url)) return
-    // A real navigation happened: recover the renderer document and retry.
-    await page.evaluate(() => location.replace("oc://renderer/index.html")).catch(() => undefined)
-    await Bun.sleep(1_000)
+async function requireVisibleDocument(page: BenchmarkPage) {
+  const visible = () => page.evaluate(() => document.visibilityState === "visible")
+  if (await visible()) return
+  // Another window covering the app fully hides the document; raise the app
+  // (untimed) and give the compositor a moment before giving up.
+  await page.rawCommand("Page.bringToFront", {})
+  const deadline = performance.now() + 3_000
+  while (performance.now() < deadline) {
+    await Bun.sleep(100)
+    if (await visible()) return
   }
-  throw new Error(`OpenCode route ${href} kept leaving the renderer document`)
+  const state = await page.evaluate(() => document.visibilityState)
+  throw new Error(`OpenCode window is not visible (document.visibilityState=${state}); keep the app window on screen and unobscured during the run`)
 }
 
 type ActivationTarget = { kind: "tab" | "row"; point: { x: number; y: number } }
@@ -259,8 +264,9 @@ type ActivationTarget = { kind: "tab" | "row"; point: { x: number; y: number } }
 /**
  * Untimed setup that leaves exactly one trusted click between the driver and
  * the destination: an open titlebar tab (the app's warm path), or a session row
- * on the home page, revealed by opening the workspace route, the home page,
- * and the home session search — the same controls a user has.
+ * on the home page, revealed by the Home button and the home session search —
+ * the same controls a user has. Workspaces are already registered in the
+ * profile's project list, so no workspace navigation happens here.
  */
 async function revealActivationTarget(
   page: BenchmarkPage,
@@ -268,14 +274,13 @@ async function revealActivationTarget(
   workspaces: Map<string, string>,
   timeoutMs: number,
   log: (line: string) => void,
-  openProject: (directory: string) => Promise<void>,
 ): Promise<ActivationTarget> {
   const directory = workspaces.get(target.workspaceId)
   if (!directory) throw new Error(`OpenCode has no workspace directory for ${target.workspaceId}`)
+  await requireVisibleDocument(page)
   const deadline = performance.now() + timeoutMs
   let lastAction = ""
   let searched = false
-  let openedRoute = false
   while (performance.now() < deadline) {
     const step = await page.evaluate(
       (arg: { title: string; base: string; searchQuery: string }) => {
@@ -309,20 +314,9 @@ async function revealActivationTarget(
     if (step.action !== lastAction) log(`reveal ${target.logicalSessionId}: ${step.action}`)
     lastAction = step.action
     if (step.action === "go-home") {
-      await followRoute(page, "/")
+      await goHome(page, log)
     } else if (step.action === "open-project") {
-      if (openedRoute) {
-        await Bun.sleep(200)
-        continue
-      }
-      openedRoute = true
-      await openProject(directory)
-      await followRoute(page, `/${workspaceSlug(directory)}/session`)
-      await Bun.sleep(1_000)
-      // Opening a workspace by route lands on a draft; close that draft tab so no
-      // empty "New session" tab is left behind, then return to the home page.
-      await closeDraftTabs(page)
-      await followRoute(page, "/")
+      throw new Error(`OpenCode home page does not list the ${target.workspaceId} workspace (the profile's project list is seeded at materialization)`)
     } else if (step.action === "search") {
       if (searched) {
         await Bun.sleep(200)
@@ -354,9 +348,8 @@ async function activateSession(
   workspaces: Map<string, string>,
   timeoutMs: number,
   log: (line: string) => void,
-  openProject: (directory: string) => Promise<void>,
 ): Promise<ActivationResult> {
-  const activation = await revealActivationTarget(page, target, workspaces, timeoutMs, log, openProject)
+  const activation = await revealActivationTarget(page, target, workspaces, timeoutMs, log)
   const armed = observeSessionReady(page, target, timeoutMs, { requireTrustedInput: true })
   void armed.catch(() => undefined)
   await page.rawCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: activation.point.x, y: activation.point.y })
@@ -367,6 +360,9 @@ async function activateSession(
   if (textSha256(result.text) !== expected) {
     throw new Error(`OpenCode painted content does not match the corpus for ${target.logicalSessionId} (${result.partId})`)
   }
+  // Untimed: with a real session open, drop the empty draft tab the app opens
+  // at startup so the tab strip holds only sessions.
+  await closeDraftTabs(page)
   return result
 }
 
@@ -403,8 +399,16 @@ function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeo
         let previous: string | undefined
         let stable = 0
         let diagnostic: Record<string, unknown> = {}
+        // rAF stops while the window is hidden or occluded; without frames
+        // nothing can be measured, so fail on the wall clock instead of hanging.
+        const guard = setTimeout(() => {
+          reject(new Error(`OpenCode session readiness produced no frames before the deadline (document ${document.visibilityState}; keep the app window visible and unobscured): ${JSON.stringify(diagnostic)}`))
+        }, Math.max(5_000, arg.timeoutMs - 10_000) + 1_000)
         const frame = (at: number) => {
-          if (performance.now() >= deadline) return reject(new Error(`OpenCode session readiness timed out: ${JSON.stringify(diagnostic)}`))
+          if (performance.now() >= deadline) {
+            clearTimeout(guard)
+            return reject(new Error(`OpenCode session readiness timed out: ${JSON.stringify(diagnostic)}`))
+          }
           const trusted = input.lastTrustedAt
           if (trusted === undefined || at < trusted) {
             previous = undefined
@@ -448,6 +452,7 @@ function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeo
           stable = ready && signature === previous ? stable + 1 : ready ? 1 : 0
           previous = signature
           if (stable >= 2) {
+            clearTimeout(guard)
             resolve({ trustedInputAt: trusted, paintedAt: performance.now(), timeOrigin: performance.timeOrigin, partId: painted!.id, text })
             return
           }
@@ -459,13 +464,21 @@ function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeo
   )
 }
 
-/** Closes empty "New session" draft tabs that opening a workspace by route leaves behind. */
+/** Closes empty "New session" draft tabs (the app opens one at startup while nothing else is open). */
 async function closeDraftTabs(page: BenchmarkPage) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const closed = await page.evaluate(() => {
       const tabs = [...document.querySelectorAll<HTMLElement>('[data-slot="titlebar-tab-item"]')]
-      const draft = tabs.find((tab) => /^\s*new session\s*$/iu.test((tab.querySelector('[data-slot="tab-title"]') as HTMLElement | null)?.innerText ?? tab.innerText))
-      const close = draft?.querySelector<HTMLElement>('[data-slot="tab-close"]')
+      const titleOf = (tab: HTMLElement) => {
+        const title = tab.querySelector<HTMLElement>('[data-slot="tab-title"]')
+        const text = (title ?? tab).innerText.trim().split("\n")
+        return text[text.length - 1]?.trim() ?? ""
+      }
+      const drafts = tabs.filter((tab) => /^(?:new session)?$/iu.test(titleOf(tab)))
+      // The app keeps one draft tab while nothing else is open; closing it only
+      // makes the app create another. Only drafts beside a real session tab go.
+      if (drafts.length === 0 || drafts.length === tabs.length) return false
+      const close = drafts[0]?.querySelector<HTMLElement>('[data-slot="tab-close"]')
       if (!close) return false
       close.click()
       return true

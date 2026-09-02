@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto"
 import { constants as fsConstants } from "node:fs"
-import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { access, cp, mkdir, readFile, rm, writeFile, realpath } from "node:fs/promises"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import type { ReadinessTarget } from "./corpus"
@@ -208,7 +208,10 @@ await sdk.serveDriver({
   }),
   prepare: async (params) => {
     if (prepared) throw new Error("OpenCode driver is already prepared")
-    const privateRoot = path.join(path.resolve(params.runDirectory), "driver-state", "opencode")
+    // The run directory is handed over as macOS spells it (`/var/...`), while
+    // git and the app resolve worktrees to the real path (`/private/var/...`).
+    // Sessions are imported and opened under the real path so both agree.
+    const privateRoot = path.join(await realpath(path.resolve(params.runDirectory)), "driver-state", "opencode")
     const p0 = path.join(privateRoot, "P0")
     const p1 = path.join(privateRoot, "P1")
     const materialization = await materializeCorpus({
