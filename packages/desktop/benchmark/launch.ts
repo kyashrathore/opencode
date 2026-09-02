@@ -102,7 +102,7 @@ export async function launchOpenCode(input: {
     page = await connectCdpPage({ port: debugPort, process: application, timeoutMs })
     const connected = page
     await installInputRecorder(connected)
-    await connected.rawCommand("Page.bringToFront", {})
+    await activateApplication(input.executable, connected)
     // Wait for the app shell before touching any control.
     await connected.waitForFunction(() => !!document.querySelector('[data-slot="titlebar-v2"], [data-slot="home-projects-scroll"], [data-component="prompt-input"]'), undefined, { polling: "raf", timeout: timeoutMs })
     // The control session is reached the way a user reaches it: the home page
@@ -241,6 +241,22 @@ async function goHome(page: BenchmarkPage, log: (line: string) => void, timeoutM
 }
 
 /**
+ * Makes the app the frontmost application, as the other drivers do for their
+ * apps before timing frames. Chromium's `Page.bringToFront` only raises the
+ * window inside the app; the application itself is activated through the
+ * standard Apple Event, which does not need accessibility permissions.
+ */
+async function activateApplication(executable: string | undefined, page: BenchmarkPage) {
+  await page.rawCommand("Page.bringToFront", {})
+  const name = executable ? path.basename(executable) : applicationName
+  if (!name) return
+  applicationName = name
+  const child = Bun.spawn({ cmd: ["osascript", "-e", `tell application "${name.replace(/"/gu, "")}" to activate`], stdout: "ignore", stderr: "ignore" })
+  await Promise.race([child.exited, Bun.sleep(5_000)])
+}
+let applicationName: string | undefined
+
+/**
  * Frame timing needs a visible window: rAF stops while the document is hidden
  * or the window is fully occluded, so every frame-based wait would starve.
  */
@@ -249,7 +265,7 @@ async function requireVisibleDocument(page: BenchmarkPage) {
   if (await visible()) return
   // Another window covering the app fully hides the document; raise the app
   // (untimed) and give the compositor a moment before giving up.
-  await page.rawCommand("Page.bringToFront", {})
+  await activateApplication(undefined, page)
   const deadline = performance.now() + 3_000
   while (performance.now() < deadline) {
     await Bun.sleep(100)
