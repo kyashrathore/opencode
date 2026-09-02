@@ -47,7 +47,7 @@ type Clock = { kind: "single-monotonic-clock"; clock: string; start: number; end
 type ReadinessCheck = { id: string; passed: true; observedAt?: number }
 type ReadinessReceipt = { endpoint: "correct-content-painted-and-input-ready"; checks: ReadinessCheck[] }
 
-const log = (line: string) => process.stderr.write(`[opencode-driver] ${line}\n`)
+const log = (line: string) => process.stderr.write(`[opencode-driver ${new Date().toISOString().slice(11, 23)}] ${line}\n`)
 
 function readinessReceipt(observedAt: number): ReadinessReceipt {
   return {
@@ -201,7 +201,7 @@ await sdk.serveDriver({
     driver: { name: "opencode-desktop-driver", version: "1", sourceCommit, digestSha256: driverDigestSha256 },
     // workspace-panel-v2 is advertised so a paired schedule can include it; its
     // actions are reported as unsupported (never scored as zero).
-    scenarios: ["app-start-v3", "session-switch-v3", "session-navigation-v1", "workspace-panel-v2"],
+    scenarios: ["app-start-v3", "session-switch-v3", "session-navigation-v1", "workspace-panel-v2", "app-start-v4", "session-switch-v4", "session-navigation-v2", "workspace-panel-v3"],
     sourceEventFormats: ["opencode-event-v2"],
     materializationModes: ["native-opencode"],
     guiFramework: "electron",
@@ -263,7 +263,7 @@ await sdk.serveDriver({
   execute: async (params) => {
     const scenarioId = String(params.scenarioId)
     const benchmarkCase = params.case as Record<string, any>
-    if (scenarioId === "app-start-v3") {
+    if (scenarioId === "app-start-v3" || scenarioId === "app-start-v4") {
       if (current) throw new Error("OpenCode app-start requires no running application")
       const handle = requireStateHandle(params.stateHandle)
       const launch = await startFromHandle(handle)
@@ -272,7 +272,7 @@ await sdk.serveDriver({
     }
     if (!current) throw new Error("OpenCode session activation requires a running application")
     const { launch } = current
-    if (scenarioId === "session-navigation-v1") {
+    if (scenarioId === "session-navigation-v1" || scenarioId === "session-navigation-v2") {
       const navigationType = String(benchmarkCase.navigationType)
       const destinationId = String(benchmarkCase.destinationSessionId)
       const destination = resolveTarget(destinationId)
@@ -292,7 +292,7 @@ await sdk.serveDriver({
         timingEvidence: { trustedInputAt: clock.start, trustedInputEvent: "pointerdown" },
       }
     }
-    if (scenarioId === "session-switch-v3") {
+    if (scenarioId === "session-switch-v3" || scenarioId === "session-switch-v4") {
       const destination = resolveTarget(String(benchmarkCase.destinationSessionId))
       const control = resolveTarget(String(benchmarkCase.sourceSessionId ?? "control"))
       if (benchmarkCase.workload !== "resource-control") {
@@ -303,9 +303,11 @@ await sdk.serveDriver({
         await launch.activate(control)
       }
       const clock: ActivationClock = await launch.activate(destination)
+      // Untimed: leave only the control tab so the strip never overflows.
+      if (benchmarkCase.workload !== "resource-control") await launch.resetTabs(control)
       return execution(String(benchmarkCase.caseId), clock)
     }
-    if (scenarioId === "workspace-panel-v2") {
+    if (scenarioId === "workspace-panel-v2" || scenarioId === "workspace-panel-v3") {
       throw new Error("OpenCode driver does not seed workspace panel loads; workspace-panel-v2 actions are unsupported")
     }
     throw new Error(`OpenCode driver does not support scenario ${scenarioId}`)

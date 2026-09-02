@@ -46,6 +46,8 @@ export type AppLaunch = {
   activate(target: ReadinessTarget): Promise<ActivationClock>
   /** True when the app has already shown this session in this process (an open tab was observed). */
   wasDisplayed(target: ReadinessTarget): Promise<boolean>
+  /** Untimed: closes every tab except the kept session's so the strip never overflows across cases. */
+  resetTabs(keep: ReadinessTarget): Promise<void>
   shutdown(): Promise<{ terminated: OwnedProcess[]; survivors: OwnedProcess[] }>
 }
 
@@ -108,7 +110,9 @@ export async function launchOpenCode(input: {
     // The control session is reached the way a user reaches it: the home page
     // lists the workspace's sessions and the row is clicked (or its open tab).
     // The app-start clock runs from process spawn to that session being painted.
+    const displayed = new Set<string>()
     const ready = await activateSession(connected, input.control, input.workspaces, timeoutMs, log)
+    displayed.add(input.control.sessionId)
     const readyAtMs = ready.timeOrigin + ready.paintedAt - performance.timeOrigin
 
     const table = await readProcessTable()
@@ -135,15 +139,20 @@ export async function launchOpenCode(input: {
       readyAtMs,
       async activate(target) {
         const result = await activateSession(connected, target, input.workspaces, timeoutMs, log)
+        displayed.add(target.sessionId)
         return { kind: "single-monotonic-clock", clock: "performance.now", start: result.trustedInputAt, end: result.paintedAt }
       },
       async wasDisplayed(target) {
-        // Opening a project makes the app show that project's most recent
-        // session, so a scheduled cold destination can already have a tab.
+        // A session shown earlier in this process (activated by the driver or
+        // restored as a tab at launch) is no longer cold for the app.
+        if (displayed.has(target.sessionId)) return true
         return connected.evaluate(
           (title: string) => [...document.querySelectorAll('[data-slot="titlebar-tab-item"]')].some((tab) => (tab.textContent ?? "").replace(/\s+/gu, " ").includes(title)),
           target.title,
         )
+      },
+      async resetTabs(keep) {
+        await closeTabsExcept(connected, keep, log)
       },
       async shutdown() {
         clearInterval(ownershipTimer)
@@ -307,7 +316,9 @@ async function revealActivationTarget(
           return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0
         }
         const center = (element: HTMLElement) => {
-          element.scrollIntoView({ block: "center", inline: "center" })
+          // Instant: the tab strip scrolls smoothly by default and a click at a
+          // mid-animation rectangle lands on a neighbouring tab.
+          element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" })
           const rect = element.getBoundingClientRect()
           return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
         }
@@ -365,7 +376,9 @@ async function activateSession(
   timeoutMs: number,
   log: (line: string) => void,
 ): Promise<ActivationResult> {
+  const revealStartedAt = performance.now()
   const activation = await revealActivationTarget(page, target, workspaces, timeoutMs, log)
+  const revealMs = performance.now() - revealStartedAt
   const armed = observeSessionReady(page, target, timeoutMs, { requireTrustedInput: true })
   void armed.catch(() => undefined)
   await page.rawCommand("Input.dispatchMouseEvent", { type: "mouseMoved", x: activation.point.x, y: activation.point.y })
@@ -376,9 +389,12 @@ async function activateSession(
   if (textSha256(result.text) !== expected) {
     throw new Error(`OpenCode painted content does not match the corpus for ${target.logicalSessionId} (${result.partId})`)
   }
+  const readyMs = performance.now() - revealStartedAt - revealMs
   // Untimed: with a real session open, drop the empty draft tab the app opens
   // at startup so the tab strip holds only sessions.
+  const draftsStartedAt = performance.now()
   await closeDraftTabs(page)
+  log(`activated ${target.logicalSessionId} via ${activation.kind}: reveal ${revealMs.toFixed(0)} ms, click→ready ${readyMs.toFixed(0)} ms (timed ${(result.paintedAt - result.trustedInputAt).toFixed(0)} ms), drafts ${(performance.now() - draftsStartedAt).toFixed(0)} ms`)
   return result
 }
 
@@ -389,7 +405,7 @@ async function activateSession(
  */
 function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeoutMs: number, options: { requireTrustedInput: boolean }): Promise<ActivationResult> {
   return page.evaluate(
-    (arg: { firstPartId: string; finalPartId: string; timeoutMs: number; requireTrustedInput: boolean }) =>
+    (arg: { firstPartId: string; finalPartId: string; title: string; timeoutMs: number; requireTrustedInput: boolean }) =>
       new Promise<ActivationResult>((resolve, reject) => {
         const carrier = window as Window & { __benchInput?: { lastTrustedAt?: number } }
         const input = carrier.__benchInput
@@ -431,6 +447,11 @@ function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeo
             stable = 0
             requestAnimationFrame(frame)
             return
+          }
+          const activeTab = document.querySelector<HTMLElement>('[data-slot="titlebar-tab-item"]:has(a[aria-current])')
+          if (activeTab && !(activeTab.textContent ?? "").replace(/\s+/gu, " ").includes(arg.title) && at - trusted > 1_500) {
+            clearTimeout(guard)
+            return reject(new Error(`OpenCode activated a different tab (${(activeTab.textContent ?? "").replace(/\s+/gu, " ").trim().slice(0, 60)}) instead of ${arg.title}`))
           }
           const candidates = [
             { id: arg.finalPartId, element: document.querySelector<HTMLElement>(partSelector(arg.finalPartId)) },
@@ -476,8 +497,35 @@ function observeSessionReady(page: BenchmarkPage, target: ReadinessTarget, timeo
         }
         requestAnimationFrame(frame)
       }),
-    { firstPartId: target.firstPartId, finalPartId: target.finalPartId, timeoutMs, requireTrustedInput: options.requireTrustedInput },
+    { firstPartId: target.firstPartId, finalPartId: target.finalPartId, title: target.title, timeoutMs, requireTrustedInput: options.requireTrustedInput },
   )
+}
+
+/**
+ * Closes every tab except the kept session's. Between switch cases the strip
+ * would otherwise grow by one tab per destination until it overflows into
+ * icon-only tabs, a state the app handles poorly and a user rarely reaches.
+ * Warm destinations are reopened by the warm visit itself before measurement.
+ */
+async function closeTabsExcept(page: BenchmarkPage, keep: ReadinessTarget, log: (line: string) => void) {
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const state = await page.evaluate((title: string) => {
+      const tabs = [...document.querySelectorAll<HTMLElement>('[data-slot="titlebar-tab-item"]')]
+      const titles = tabs.map((tab) => (tab.textContent ?? "").replace(/\s+/gu, " ").trim().slice(0, 40))
+      const other = tabs.find((tab) => !(tab.textContent ?? "").replace(/\s+/gu, " ").includes(title))
+      const close = other?.querySelector<HTMLElement>('[data-slot="titlebar-tab-close"], button[aria-label="Close tab"]')
+      if (!other) return { done: true, titles }
+      if (!close) return { done: true, titles, stuck: true }
+      close.click()
+      return { done: false, titles }
+    }, keep.title)
+    if (state.done) {
+      if (state.stuck) log(`reset tabs: a tab has no close control; tabs ${JSON.stringify(state.titles)}`)
+      return
+    }
+    await Bun.sleep(60)
+  }
+  log(`reset tabs: gave up after 64 attempts`)
 }
 
 /** Closes empty "New session" draft tabs (the app opens one at startup while nothing else is open). */
@@ -494,7 +542,7 @@ async function closeDraftTabs(page: BenchmarkPage) {
       // The app keeps one draft tab while nothing else is open; closing it only
       // makes the app create another. Only drafts beside a real session tab go.
       if (drafts.length === 0 || drafts.length === tabs.length) return false
-      const close = drafts[0]?.querySelector<HTMLElement>('[data-slot="tab-close"]')
+      const close = drafts[0]?.querySelector<HTMLElement>('[data-slot="titlebar-tab-close"], button[aria-label="Close tab"]')
       if (!close) return false
       close.click()
       return true
