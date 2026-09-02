@@ -276,8 +276,8 @@ await sdk.serveDriver({
       if (navigationType === "return-visited-panel-open") {
         throw new Error("OpenCode driver does not seed workspace panel loads; panel-open session returns are unsupported")
       }
-      if (navigationType === "first-visit" && visitedDestinations.has(destinationId)) {
-        throw new Error("OpenCode first-visit destination was already displayed in this process")
+      if (navigationType === "first-visit" && (visitedDestinations.has(destinationId) || (await launch.wasDisplayed(destination)))) {
+        throw new Error("OpenCode first-visit destination was already displayed in this process (the app opens a project's most recent session when the project is opened)")
       }
       if (navigationType === "return-visited-panel-closed" && !visitedDestinations.has(destinationId)) {
         throw new Error("OpenCode return navigation requires a prior first-visit of the destination in this process")
@@ -293,6 +293,9 @@ await sdk.serveDriver({
       const destination = resolveTarget(String(benchmarkCase.destinationSessionId))
       const control = resolveTarget(String(benchmarkCase.sourceSessionId ?? "control"))
       if (benchmarkCase.workload !== "resource-control") {
+        if (benchmarkCase.sessionState === "cold" && (await launch.wasDisplayed(destination))) {
+          throw new Error("OpenCode cold destination was already displayed in this process (the app opens a project's most recent session when the project is opened)")
+        }
         if (benchmarkCase.sessionState === "warm") await launch.activate(destination)
         await launch.activate(control)
       }

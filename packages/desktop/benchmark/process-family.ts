@@ -64,3 +64,8 @@ export function sameProcessIdentity(left: Pick<ProcessSnapshot, "pid" | "startTi
  * the benchmark reads the same instrument the application reports from, rather
  * than inventing a second definition of physical footprint.
  */
+
+function fromIdleRow(row: IdleProcessRow): ProcessSnapshot {
+  const executable = row.command.trim().split(/\s+/u)[0] ?? "";
+  return { pid: row.pid, parentPid: row.ppid, startTimeMs: row.startedAtMs, rssBytes: row.rssBytes, cpuSeconds: row.cpuSeconds, executable, command: row.command };
+}
