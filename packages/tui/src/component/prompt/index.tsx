@@ -26,6 +26,7 @@ import { editorSelectionKey, useEditorContext, type EditorSelection } from "../.
 import { normalizePromptContent, openEditor } from "../../editor"
 import { useExit } from "../../context/exit"
 import { promptOffsetWidth } from "../../prompt/display"
+import { promptFooterPolicy, promptMetadataPolicy, type PromptMetadata } from "../../prompt/metadata"
 import { expandPromptInputPastedText, realignPromptInputMentions } from "../../prompt/mention"
 import { parseSlashHead } from "../../prompt/parse"
 import { stringWidth } from "../../util/string-width"
@@ -68,6 +69,7 @@ import { useDirectoryRecents } from "../../prompt/directory-recents"
 import { directoryRecentValue } from "../../prompt/directory-completion"
 import { useWorkingDirectoryActions } from "../../ui/working-directory-actions"
 import { truncateFilePath } from "../../ui/file-path"
+import { contextUsage, formatContextUsage } from "../../util/session"
 
 export type PromptProps = {
   sessionID?: string
@@ -98,6 +100,7 @@ export type PromptRef = {
 
 const DRAFT_RETENTION_MIN_CHARS = 20
 const revealedPromptMetadata = new WeakSet<object>()
+const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
 
 function randomIndex(count: number) {
   if (count <= 0) return 0
@@ -205,6 +208,7 @@ export function Prompt(props: PromptProps) {
   const data = useData()
   const directoryRecents = useDirectoryRecents()
   const keymapCommands = Keymap.useCommands()
+  const shortcuts = Keymap.useShortcuts()
   const currentLocation = useLocation()
   const config = useConfig().data
   const dialog = useDialog()
@@ -1591,6 +1595,49 @@ export function Prompt(props: PromptProps) {
     () => !!promptDisplay().agentLabel && store.mode === "normal" && !!promptDisplay().variant,
     metadataAnimationsEnabled,
   )
+  const [metadataWidth, setMetadataWidth] = createSignal(Math.max(0, dimensions().width - 8))
+  const [footerWidth, setFooterWidth] = createSignal(Math.max(0, dimensions().width - 4))
+  const promptUsage = createMemo(() => {
+    if (!props.sessionID) return []
+    const session = data.session.get(props.sessionID)
+    if (!session) return []
+    const usage = contextUsage(
+      data.session.message.list(props.sessionID),
+      data.location.model.list(session.location),
+      session.revert?.messageID,
+    )
+    const cost = data.session.cost(props.sessionID)
+    return [
+      usage ? formatContextUsage(usage.tokens, usage.percent) : undefined,
+      cost > 0 ? money.format(cost) : undefined,
+    ].filter((item): item is string => Boolean(item))
+  })
+  const promptShortcuts = createMemo(() => {
+    const command = shortcuts.get("command.palette.show")
+    if (promptUsage().length > 0) return command ? [`${command} commands`] : []
+    return [
+      shortcuts.get("agent.cycle") ? `${shortcuts.get("agent.cycle")} agents` : undefined,
+      command ? `${command} commands` : undefined,
+    ].filter((item): item is string => Boolean(item))
+  })
+  const metadata = createMemo<PromptMetadata>(() => {
+    if (store.mode === "shell") return { agent: agentLabel() ?? "Shell", text: agentLabel() ?? "Shell" }
+    return promptMetadataPolicy({
+      width: metadataWidth(),
+      agent: agentLabel() ?? "",
+      auto: local.permission.mode === "auto",
+      model: promptDisplay().modelLabel,
+      provider: promptDisplay().providerLabel,
+      variant: promptDisplay().variant,
+    })
+  })
+  const footer = createMemo(() =>
+    promptFooterPolicy({
+      width: footerWidth(),
+      usage: promptUsage(),
+      shortcuts: promptShortcuts(),
+    }),
+  )
   createEffect(() => {
     if (agentLabel()) revealedPromptMetadata.add(local)
   })
@@ -1598,7 +1645,8 @@ export function Prompt(props: PromptProps) {
   const footerInput = () => ({
     sessionID: props.sessionID,
     mode: store.mode,
-    showDetails: store.interrupt === 0 || dimensions().width >= 80,
+    showUsage: footer().usage && (store.interrupt === 0 || dimensions().width >= 80),
+    showDetails: footer().shortcuts && (store.interrupt === 0 || dimensions().width >= 80),
   })
 
   const placeholderText = createMemo(() => {
@@ -1838,50 +1886,60 @@ export function Prompt(props: PromptProps) {
               syntaxStyle={syntax()}
             />
             <box flexDirection="row" flexShrink={0} paddingTop={1} gap={1} justifyContent="space-between">
-              <box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0}>
-                <Show when={agentLabel()} fallback={<box height={1} />}>
-                  {(label) => (
-                    <>
-                      <text fg={fadeColor(highlight(), agentMetaAlpha())}>{label()}</text>
-                      <Show
-                        when={store.mode === "normal" && local.permission.mode === "auto" && dimensions().width >= 44}
-                      >
-                        <text fg={fadeColor(theme.text.subdued, agentMetaAlpha())}>auto</text>
-                      </Show>
-                      <Show when={store.mode === "normal" && dimensions().width >= 28}>
-                        <box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0}>
+              <box
+                flexDirection="row"
+                gap={1}
+                flexGrow={1}
+                flexShrink={1}
+                minWidth={0}
+                onSizeChange={function (this: BoxRenderable) {
+                  const width = this.width
+                  queueMicrotask(() => setMetadataWidth(width))
+                }}
+              >
+                <Show when={metadata().agent || metadata().model} fallback={<box height={1} />}>
+                  <>
+                    <Show when={metadata().agent}>
+                      {(label) => <text fg={fadeColor(highlight(), agentMetaAlpha())}>{label()}</text>}
+                    </Show>
+                    <Show when={store.mode === "normal" && metadata().auto}>
+                      <text fg={fadeColor(theme.text.subdued, agentMetaAlpha())}>auto</text>
+                    </Show>
+                    <Show when={store.mode === "normal" && metadata().model}>
+                      <box flexDirection="row" gap={1} flexGrow={1} flexShrink={1} minWidth={0}>
+                        <Show when={metadata().agent}>
                           <text fg={fadeColor(theme.text.subdued, modelMetaAlpha())}>·</text>
-                          <text
-                            flexShrink={1}
-                            minWidth={0}
-                            wrapMode="none"
-                            truncate
-                            fg={fadeColor(muted() ? theme.text.subdued : theme.text.default, modelMetaAlpha())}
-                          >
-                            {promptDisplay().modelLabel}
+                        </Show>
+                        <text
+                          flexShrink={1}
+                          minWidth={0}
+                          wrapMode="none"
+                          truncate
+                          fg={fadeColor(muted() ? theme.text.subdued : theme.text.default, modelMetaAlpha())}
+                        >
+                          {metadata().model}
+                        </text>
+                        <Show when={metadata().provider}>
+                          <text flexShrink={0} fg={fadeColor(theme.text.subdued, modelMetaAlpha())}>
+                            {metadata().provider}
                           </text>
-                          <Show when={dimensions().width >= 50}>
-                            <text flexShrink={0} fg={fadeColor(theme.text.subdued, modelMetaAlpha())}>
-                              {promptDisplay().providerLabel}
-                            </text>
-                          </Show>
-                          <Show when={promptDisplay().variant && dimensions().width >= 70}>
-                            <text fg={fadeColor(theme.text.subdued, variantMetaAlpha())}>·</text>
-                            <text>
-                              <span
-                                style={{
-                                  fg: fadeColor(theme.text.feedback.warning.default, variantMetaAlpha()),
-                                  bold: true,
-                                }}
-                              >
-                                {promptDisplay().variant}
-                              </span>
-                            </text>
-                          </Show>
-                        </box>
-                      </Show>
-                    </>
-                  )}
+                        </Show>
+                        <Show when={metadata().variant}>
+                          <text fg={fadeColor(theme.text.subdued, variantMetaAlpha())}>·</text>
+                          <text>
+                            <span
+                              style={{
+                                fg: fadeColor(theme.text.feedback.warning.default, variantMetaAlpha()),
+                                bold: true,
+                              }}
+                            >
+                              {metadata().variant}
+                            </span>
+                          </text>
+                        </Show>
+                      </box>
+                    </Show>
+                  </>
                 </Show>
               </box>
               <Show when={hasRightContent()}>
@@ -1918,7 +1976,16 @@ export function Prompt(props: PromptProps) {
             }
           />
         </box>
-        <box width="100%" flexDirection="row" justifyContent="space-between" gap={2}>
+        <box
+          width="100%"
+          flexDirection="row"
+          justifyContent="space-between"
+          gap={2}
+          onSizeChange={function (this: BoxRenderable) {
+            const width = this.width
+            queueMicrotask(() => setFooterWidth(width))
+          }}
+        >
           <Slot path="prompt.footer" input={footerInput()}>
             <Slot path="prompt.footer.status" input={footerInput()}>
               <box

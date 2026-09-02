@@ -160,6 +160,7 @@ type PromptFooterInput = {
   readonly sessionID?: string
   readonly mode: "normal" | "shell"
   readonly showDetails: boolean
+  readonly showUsage?: boolean
 }
 
 /**

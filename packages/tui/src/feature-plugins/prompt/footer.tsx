@@ -12,6 +12,7 @@ export function PromptFooter(props: {
   context: Plugin.Context
   sessionID?: string
   mode: "normal" | "shell"
+  showUsage?: boolean
   showDetails: boolean
 }) {
   const dimensions = useTerminalDimensions()
@@ -53,7 +54,7 @@ export function PromptFooter(props: {
       <Match when={props.mode === "normal"}>
         <Switch>
           <Match when={live() || status().length > 0}>
-            <box flexDirection="row" flexShrink={1} minWidth={0}>
+            <box flexDirection="row" flexShrink={(props.showUsage ?? props.showDetails) ? 0 : 1} minWidth={0}>
               <Show when={live()}>
                 <box
                   flexShrink={0}
@@ -74,15 +75,15 @@ export function PromptFooter(props: {
                   </text>
                 </box>
               </Show>
-              <Show when={props.showDetails && status().length > 0}>
-                <text fg={props.context.theme.text.subdued} wrapMode="none" truncate flexShrink={1}>
+              <Show when={(props.showUsage ?? props.showDetails) && status().length > 0}>
+                <text fg={props.context.theme.text.subdued} wrapMode="none" flexShrink={0}>
                   <Show when={live()}> · </Show>
                   {status().join(" · ")}
                 </text>
               </Show>
             </box>
           </Match>
-          <Match when={props.showDetails && dimensions().width >= 44}>
+          <Match when={props.showDetails}>
             <text fg={props.context.theme.text.default} flexShrink={0}>
               {shortcut("agent.cycle")} <span style={{ fg: props.context.theme.text.subdued }}>agents</span>
             </text>
@@ -116,6 +117,7 @@ export default Plugin.define({
           context={context}
           sessionID={props.sessionID}
           mode={props.mode}
+          showUsage={props.showUsage ?? props.showDetails}
           showDetails={props.showDetails}
         />
       ),

@@ -105,6 +105,7 @@ test("prompt footer can hide details", async () => {
     },
   } as unknown as Context
   const [showDetails, setShowDetails] = createSignal(true)
+  const [showUsage, setShowUsage] = createSignal(true)
   const [sessionID, setSessionID] = createSignal<string | undefined>("session")
   const app = await testRender(
     () => (
@@ -114,6 +115,7 @@ test("prompt footer can hide details", async () => {
           sessionID={sessionID()}
           mode="normal"
           showDetails={showDetails()}
+          showUsage={showUsage()}
         />
       </box>
     ),
@@ -130,10 +132,13 @@ test("prompt footer can hide details", async () => {
 
     setShowDetails(false)
     await app.renderOnce()
-    const frame = app.captureCharFrame()
-    expect(frame).not.toContain("1.0K (10%)")
-    expect(frame).not.toContain("$1.00")
-    expect(frame).not.toContain("ctrl+p commands")
+    expect(app.captureCharFrame()).toContain("1.0K (10%) · $1.00")
+    expect(app.captureCharFrame()).not.toContain("ctrl+p commands")
+
+    setShowUsage(false)
+    await app.renderOnce()
+    expect(app.captureCharFrame()).not.toContain("1.0K (10%)")
+    expect(app.captureCharFrame()).not.toContain("$1.00")
 
     setSessionID(undefined)
     await app.renderOnce()
