@@ -221,6 +221,9 @@ export function createMainWindow(id: string = randomUUID()) {
   })
 
   state.manage(win)
+  // Benchmark hook: the compared apps start maximized on the host display, and
+  // a fresh profile has no saved window state to restore that from.
+  if (process.env.OPENCODE_DESKTOP_WINDOW_MAXIMIZED === "1") win.maximize()
   registerWindow(win, id)
   wireFullscreen(win)
   loadWindow(win, "index.html")

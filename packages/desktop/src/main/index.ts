@@ -3,7 +3,7 @@ import { mkdirSync, rmSync } from "node:fs"
 import * as http from "node:http"
 import { createServer } from "node:net"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import { getCACertificates, setDefaultCACertificates } from "node:tls"
 import type { Event } from "electron"
 import { app, BrowserWindow } from "electron"
@@ -140,11 +140,21 @@ const main = Effect.gen(function* () {
   })()
   app.setName(app.isPackaged ? APP_NAMES[CHANNEL] : "OpenCode Dev")
   app.setAppUserModelId(appId)
-  app.setPath(
-    "userData",
-    onboardingTestRoot ? join(onboardingTestRoot, "desktop") : join(app.getPath("appData"), appId),
-  )
-  if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
+  // Benchmark and test isolation: an absolute OPENCODE_DESKTOP_USER_DATA_DIR
+  // relocates the whole profile (userData and sessionData) so a driver can seal
+  // application state without touching the operator's own profile. Electron
+  // derives appData from the system home directory, not $HOME, so the XDG and
+  // HOME overrides alone cannot do this.
+  const userDataOverride = process.env.OPENCODE_DESKTOP_USER_DATA_DIR
+  const userDataDir =
+    userDataOverride && isAbsolute(userDataOverride)
+      ? userDataOverride
+      : onboardingTestRoot
+        ? join(onboardingTestRoot, "desktop")
+        : join(app.getPath("appData"), appId)
+  app.setPath("userData", userDataDir)
+  if (userDataOverride && isAbsolute(userDataOverride)) app.setPath("sessionData", join(userDataOverride, "session"))
+  else if (onboardingTestRoot) app.setPath("sessionData", join(onboardingTestRoot, "session"))
   initializeOldLayoutEligibility(app.getPath("userData"))
   logger = initLogging()
   initCrashReporter()
